@@ -1,6 +1,8 @@
-"""Offline smoke test — checks imports, storage paths, every file loader
-(PDF/DOCX/CSV/TXT/MD), and the aggregation safety net, without calling the
-OpenAI API, so it works even before an API key is configured.
+"""Offline smoke test - checks imports, storage paths, every file loader
+(PDF/DOCX/CSV/TXT/MD), the aggregation safety net, the AND/OR filter
+normalization, numeric comparisons (gt/gte/lt/lte/between), not_equals/
+not_in, and the router-prompt / router-recovery safety nets - all without
+calling the OpenAI API, so it works even before an API key is configured.
 Run with: python verify.py
 """
 import io, types
@@ -150,7 +152,7 @@ print(f"OK: classify_query() recovers from a garbled router response end-to-end 
 # correctly routed to exact_lookup with a filter naming the person, but the
 # old exact_lookup(question, records) ignored filters entirely and instead
 # checked whether the ENTIRE question string was a substring of a single
-# field's value — which a natural-language question never is — so it always
+# field's value - which a natural-language question never is - so it always
 # returned 0 records despite the router doing its job correctly.
 lookup_records = [
     {"name": "Vikram Malhotra", "department": "Engineering", "manager": "Sunita Rao"},
@@ -162,5 +164,112 @@ assert old_style_result == [], "sanity check: confirms the original bug would fi
 fixed_result = rag.exact_lookup("Who is the manager of Vikram Malhotra?", lookup_records, lookup_filters)
 assert len(fixed_result) == 1 and fixed_result[0]["manager"] == "Sunita Rao", f"exact_lookup fix failed: {fixed_result}"
 print(f"OK: exact_lookup() uses router filters -> found {fixed_result[0]['name']}, manager={fixed_result[0]['manager']}")
+
+# --- same-field OR normalization (regression: "IT" is a substring of "with") ---
+# Reproduces the exact assertion failure the user hit: a question mentioning
+# a short department code ("IT") alongside an ordinary word that contains it
+# as a substring ("with") used to scramble the old position-based " or "
+# detection in _normalize_filters, so "Finance or IT" was left as two
+# separate equals filters (department=Finance AND department=IT) that could
+# never both match the same record, instead of being merged into one
+# `in` filter. The fix groups by field name only - no substring position
+# math - so this can no longer misfire.
+or_question = "List employees in Finance or IT department, along with their email"
+raw_filters = [
+    {"field": "department", "operator": "equals", "value": "Finance"},
+    {"field": "department", "operator": "equals", "value": "IT"},
+]
+merged = rag._normalize_filters(or_question, raw_filters)
+assert merged == [{"field": "department", "operator": "in", "value": ["Finance", "IT"]}], \
+    f"same-field OR normalization failed: {merged}"
+print(f"OK: same-field OR normalization -> merged despite 'with' containing 'it': {merged}")
+
+or_records = [
+    {"name": "A", "department": "Finance"},
+    {"name": "B", "department": "IT"},
+    {"name": "C", "department": "Marketing"},
+]
+or_result = rag.apply_filters(or_records, merged)
+assert {r["name"] for r in or_result} == {"A", "B"}, f"OR filter application failed: {or_result}"
+print(f"OK: same-field OR filter applied correctly -> matched {[r['name'] for r in or_result]}")
+
+# infer_filters_from_question must reach the same merged result independently
+# (i.e. the word-boundary regex fix), confirming the dropped-filter safety
+# net also survives the "with"/"IT" trap.
+inferred_or = rag.infer_filters_from_question(or_question, or_records)
+assert inferred_or == [{"field": "department", "operator": "in", "value": ["Finance", "IT"]}], \
+    f"infer_filters_from_question OR-merge failed: {inferred_or}"
+print(f"OK: infer_filters_from_question -> word-boundary match avoids the 'with' trap: {inferred_or}")
+
+# --- numeric comparisons: gt / gte / lt / lte / between --------------------
+salary_records = [
+    {"name": "P1", "salary_inr": "40000"},
+    {"name": "P2", "salary_inr": "55000"},
+    {"name": "P3", "salary_inr": "60000"},
+    {"name": "P4", "salary_inr": "75000"},
+]
+gt = rag.apply_filters(salary_records, [{"field": "salary_inr", "operator": "gt", "value": "55000"}])
+assert {r["name"] for r in gt} == {"P3", "P4"}, f"gt failed: {gt}"
+gte = rag.apply_filters(salary_records, [{"field": "salary_inr", "operator": "gte", "value": "55000"}])
+assert {r["name"] for r in gte} == {"P2", "P3", "P4"}, f"gte failed: {gte}"
+lt = rag.apply_filters(salary_records, [{"field": "salary_inr", "operator": "lt", "value": "55000"}])
+assert {r["name"] for r in lt} == {"P1"}, f"lt failed: {lt}"
+lte = rag.apply_filters(salary_records, [{"field": "salary_inr", "operator": "lte", "value": "55000"}])
+assert {r["name"] for r in lte} == {"P1", "P2"}, f"lte failed: {lte}"
+print("OK: apply_filters -> gt/gte/lt/lte all correct")
+
+between_filters = rag._infer_numeric_filters("salary between 50000 and 65000", salary_records)
+assert between_filters == [
+    {"field": "salary_inr", "operator": "gte", "value": "50000"},
+    {"field": "salary_inr", "operator": "lte", "value": "65000"},
+], f"between parsing failed: {between_filters}"
+between_result = rag.apply_filters(salary_records, between_filters)
+assert {r["name"] for r in between_result} == {"P2", "P3"}, f"between filter application failed: {between_result}"
+print(f"OK: 'between X and Y' -> parsed to gte/lte and matched {[r['name'] for r in between_result]}")
+
+gt_inferred = rag._infer_numeric_filters("salary more than 55000", salary_records)
+assert gt_inferred == [{"field": "salary_inr", "operator": "gt", "value": "55000"}], f"gt phrase parsing failed: {gt_inferred}"
+print(f"OK: 'more than' phrasing -> parsed to gt: {gt_inferred}")
+
+# --- not_equals / not_in ----------------------------------------------------
+status_records = [
+    {"name": "A", "status": "Active"},
+    {"name": "B", "status": "On Leave"},
+    {"name": "C", "status": "Terminated"},
+]
+not_eq = rag.apply_filters(status_records, [{"field": "status", "operator": "not_equals", "value": "Active"}])
+assert {r["name"] for r in not_eq} == {"B", "C"}, f"not_equals failed: {not_eq}"
+not_in = rag.apply_filters(status_records, [{"field": "status", "operator": "not_in", "value": ["Active", "Terminated"]}])
+assert {r["name"] for r in not_in} == {"B"}, f"not_in failed: {not_in}"
+print("OK: apply_filters -> not_equals/not_in both correct")
+
+# --- malformed comparison filter recovery (in['>50000']) -------------------
+# A router or upstream normalization step can sometimes still produce a
+# comparison encoded as an `in` filter with a single value like ">50000"
+# instead of a proper gt/50000 pair. _normalize_comparison_filter() must
+# recover the intended operator and numeric value.
+recovered_op, recovered_val = rag._normalize_comparison_filter("in", [">50000"])
+assert (recovered_op, recovered_val) == ("gt", "50000"), f"malformed '>' recovery failed: {(recovered_op, recovered_val)}"
+recovered_op2, recovered_val2 = rag._normalize_comparison_filter("in", ["<=75000"])
+assert (recovered_op2, recovered_val2) == ("lte", "75000"), f"malformed '<=' recovery failed: {(recovered_op2, recovered_val2)}"
+malformed_normalized = rag._normalize_filters("", [{"field": "salary_inr", "operator": "in", "value": [">50000"]}])
+assert malformed_normalized == [{"field": "salary_inr", "operator": "gt", "value": "50000"}], \
+    f"end-to-end malformed comparison recovery failed: {malformed_normalized}"
+print("OK: malformed comparison filters (in['>50000']) recovered to proper gt/lte operators")
+
+# --- regression guard: _classify_query_prompt must not crash ---------------
+# Reproduces the exact live crash the user hit: literal JSON braces used as
+# example text inside this f-string, if left single-braced, are parsed by
+# Python as real replacement fields and raise
+# "ValueError: Invalid format specifier ... for object of type 'str'" on
+# EVERY call to classify_query(), before any API request is even made. This
+# must build cleanly and contain the literal example text, un-mangled.
+prompt_text = rag._classify_query_prompt("Who works in Finance or IT?", ["department", "salary_inr"])
+assert '{"field":"department","operator":"in","value":["Finance","IT"]}' in prompt_text, \
+    "classify prompt lost its literal JSON example text"
+assert '{"field":"salary_inr","operator":"gt","value":"50000"}' in prompt_text, \
+    "classify prompt lost its literal JSON example text"
+assert "Who works in Finance or IT?" in prompt_text
+print("OK: _classify_query_prompt builds without crashing and preserves literal JSON examples")
 
 print("\nAll offline checks passed. Set OPENAI_API_KEY in .env, then run: streamlit run app.py")

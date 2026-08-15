@@ -301,8 +301,16 @@ _CLASSIFY_SCHEMA = {
                     "type": "object",
                     "properties": {
                         "field": {"type": "string"},
-                        "operator": {"type": "string", "enum": ["equals", "contains"]},
-                        "value": {"type": "string"},
+                        "operator": {"type": "string", "enum": ["equals", "contains", "in", "not_equals", "not_in", "gt", "gte", "lt", "lte"]},
+                        # `value` is a scalar for equals/contains and an array
+                        # for `in`. `anyOf` keeps the Structured Outputs schema
+                        # strict while supporting both shapes.
+                        "value": {
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ]
+                        },
                     },
                     "required": ["field", "operator", "value"],
                     "additionalProperties": False,
@@ -336,12 +344,50 @@ def _normalize_strategy(raw):
 
 
 def _classify_query_prompt(question, fields):
+    # NOTE: this is an f-string (interpolates {fields} and {question} below),
+    # so every literal JSON brace in the example lines MUST be doubled
+    # ({{ / }}) or Python's f-string parser reads it as a real replacement
+    # field. A previous version left these examples single-braced — e.g.
+    # `-> {"field":"department","operator":"in","value":["Finance","IT"]}` —
+    # which crashed EVERY call with "ValueError: Invalid format specifier
+    # '"department","operator":"in","value":["Finance","IT"]' for object of
+    # type 'str'": Python parsed `"field"` as the expression and everything
+    # after the first colon as a (bogus) format spec applied to it.
     return f"""Classify this question.
 Available fields: {fields}
 Question: {question}
 Use structured_filter for lists with field conditions, aggregation for count questions, exact_lookup for direct record lookup, otherwise hybrid_retrieval.
-Operators: equals, contains. Do not invent fields or values.
-IMPORTANT: if the question names a specific value (a status, department, location, or similar — e.g. "on leave", "Engineering", "Bengaluru"), you MUST include a filter for it. Only return an empty filters list when the question truly has no condition at all, such as "how many employees are there in total"."""
+Operators:
+- equals: exact single value
+- contains: substring matching
+- in: one field matches any of multiple values
+- not_equals: field does not equal the value
+- not_in: field matches none of the listed values
+- gt: numeric value greater than the specified value
+- gte: numeric value greater than or equal to the specified value
+- lt: numeric value less than the specified value
+- lte: numeric value less than or equal to the specified value
+
+BOOLEAN RULES:
+- "and" means all conditions must match (AND).
+- "or" means alternatives must match (OR).
+- If multiple values belong to the SAME field and are connected by "or", use one `in` filter with an array of values.
+- Example: "Finance or IT" -> {{"field":"department","operator":"in","value":["Finance","IT"]}}
+- Do NOT turn "department is Finance or IT" into department=Finance AND department=IT.
+
+NUMERIC COMPARISON RULES:
+- "more than", "greater than", "above", "over" -> gt
+- "at least", "greater than or equal to", "minimum" -> gte
+- "less than", "below", "under" -> lt
+- "at most", "less than or equal to", "maximum" -> lte
+- "not equal to", "not" -> not_equals when it clearly applies to one value
+- Never encode a comparison such as ">50000" as an `in` value.
+- Example: "salary more than 50000" -> {{"field":"salary_inr","operator":"gt","value":"50000"}}
+- Example: "salary at least 50000" -> {{"field":"salary_inr","operator":"gte","value":"50000"}}
+- Example: "salary between 50000 and 75000" -> two filters: salary_inr gte 50000 AND salary_inr lte 75000.
+
+Do not invent fields or values.
+IMPORTANT: if the question names a specific value (a status, department, location, salary threshold, or similar), you MUST include a filter for it. Only return an empty filters list when the question truly has no condition at all, such as "how many employees are there in total"."""
 
 
 def classify_query(question, records):
@@ -366,58 +412,293 @@ def classify_query(question, records):
         except Exception:
             return {"strategy": "hybrid_retrieval", "operation": None, "filters": [], "reason": "Router call failed."}
     data["strategy"] = _normalize_strategy(data.get("strategy"))
-    if not isinstance(data.get("filters"), list):
-        data["filters"] = []
+    data["filters"] = _normalize_filters(question, data.get("filters", []), records)
     return data
 
 
+def _normalize_filter_value(value):
+    """Normalize scalar/list filter values while preserving numeric text."""
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_comparison_filter(operator, value):
+    """Recover malformed comparison filters such as in['>50000']."""
+    if operator != "in":
+        return operator, value
+    values = value if isinstance(value, list) else [value]
+    if len(values) != 1:
+        return operator, value
+    raw = str(values[0]).strip()
+    for symbol, normalized_operator in ((">=", "gte"), ("<=", "lte"), (">", "gt"), ("<", "lt")):
+        if raw.startswith(symbol):
+            numeric_value = raw[len(symbol):].strip()
+            if numeric_value:
+                return normalized_operator, numeric_value
+    return operator, value
+
+
+def _normalize_filters(question, filters, records=None):
+    """Normalize router output and recover common malformed boolean/numeric filters."""
+    if not isinstance(filters, list):
+        return []
+
+    valid_ops = {"equals", "contains", "in", "not_equals", "not_in", "gt", "gte", "lt", "lte"}
+    normalized = []
+
+    for raw in filters:
+        if not isinstance(raw, dict):
+            continue
+        field = str(raw.get("field", "")).strip()
+        if not field:
+            continue
+        op = str(raw.get("operator", "equals")).strip().lower()
+        if op not in valid_ops:
+            op = "equals"
+        value = _normalize_filter_value(raw.get("value"))
+        op, value = _normalize_comparison_filter(op, value)
+
+        if op in {"in", "not_in"}:
+            values = value if isinstance(value, list) else [value]
+            values = [v for v in values if v]
+            if values:
+                normalized.append({"field": field, "operator": op, "value": values})
+        else:
+            if isinstance(value, list):
+                value = value[0] if value else ""
+            if value:
+                normalized.append({"field": field, "operator": op, "value": value})
+
+    q = (question or "").lower()
+    if " or " not in q or len(normalized) < 2:
+        return normalized
+
+    # Multiple equals/contains conditions on the SAME field can never all be
+    # true for one record at once (a department can't equal both "Finance"
+    # and "IT" simultaneously) — whenever the question also contains " or ",
+    # that's a reliable signal they were meant as alternatives, not an AND.
+    #
+    # A previous version tried to *verify* this by locating each value's
+    # word position in the question text (via str.find) and checking for a
+    # literal " or " between them. That broke on short values like "IT",
+    # which are literal substrings of ordinary words ("with", "wait",
+    # "unit", ...) — str.find("it") would latch onto the "it" inside "with"
+    # long before the real "IT" token, scrambling the position order and
+    # silently defeating the merge. This is exactly the bug that turned a
+    # Finance/IT "or" question into two separate, mutually-exclusive
+    # "contains" filters that could never both match.
+    #
+    # Grouping by field name alone — no position math at all — fixes this
+    # and is simpler: it can't misfire the way substring matching did.
+    field_groups: dict[str, list[dict]] = {}
+    for condition in normalized:
+        if condition["operator"] in {"equals", "contains"}:
+            field_groups.setdefault(condition["field"], []).append(condition)
+
+    merged = []
+    emitted_fields = set()
+    for condition in normalized:
+        field = condition["field"]
+        if condition["operator"] not in {"equals", "contains"}:
+            merged.append(condition)
+            continue
+        if field in emitted_fields:
+            continue
+        emitted_fields.add(field)
+        group = field_groups[field]
+        if len(group) >= 2:
+            merged.append({"field": field, "operator": "in", "value": [c["value"] for c in group]})
+        else:
+            merged.append(group[0])
+
+    return merged
+
+
+def _field_aliases(field):
+    aliases = {field.lower()}
+    aliases.update({
+        "salary_inr": {"salary", "salary_inr", "pay", "compensation"},
+        "department": {"department", "dept"},
+        "location": {"location", "city", "office", "place"},
+        "status": {"status"},
+        "name": {"name", "employee", "employee_name", "full_name"},
+    }.get(field, set()))
+    return aliases
+
+
+def _parse_number(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower()
+    text = text.replace(",", "").replace("₹", "").replace("inr", "").replace("rs.", "").replace("rs", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        raise ValueError(f"Not numeric: {value!r}")
+    return float(match.group(0))
+
+
+def _infer_numeric_filters(question, records):
+    q = question.lower()
+    numeric_fields = set()
+    for r in records:
+        for k, v in r.items():
+            try:
+                _parse_number(v)
+                numeric_fields.add(k)
+            except (TypeError, ValueError):
+                pass
+
+    results = []
+    for field in numeric_fields:
+        if not any(alias in q for alias in _field_aliases(field)):
+            continue
+
+        num = r"(?:₹\s*)?(\d[\d,]*(?:\.\d+)?)\s*(?:inr|rs\.?|rupees?)?"
+        between = re.search(rf"\bbetween\s+{num}\s+and\s+{num}", q)
+        if between:
+            results.extend([
+                {"field": field, "operator": "gte", "value": between.group(1).replace(",", "")},
+                {"field": field, "operator": "lte", "value": between.group(2).replace(",", "")},
+            ])
+            continue
+
+        patterns = [
+            (r"(?:more than|greater than|above|over)\s+" + num, "gt"),
+            (r"(?:at least|greater than or equal to|minimum(?: of)?)\s+" + num, "gte"),
+            (r"(?:less than|below|under)\s+" + num, "lt"),
+            (r"(?:at most|less than or equal to|maximum(?: of)?)\s+" + num, "lte"),
+        ]
+        for pattern, op in patterns:
+            match = re.search(pattern, q)
+            if match:
+                results.append({"field": field, "operator": op, "value": match.group(1).replace(",", "")})
+                break
+    return results
+
+
 def infer_filters_from_question(question, records):
-    """Safety net for when the router returns strategy=structured_filter or
-    aggregation but filters=[] even though the question clearly names a
-    specific value. An empty filter list makes apply_filters() match EVERY
-    record (there are no conditions to fail), so a dropped filter silently
-    turns "how many are on leave" into "how many employees exist at all" —
-    which is exactly how a correct 23-record answer regressed to a wrong
-    100. Field values in structured data are a closed vocabulary, so we can
-    detect them directly by scanning the question for any value that
-    actually appears in the indexed records, independent of the LLM call
-    that classified the query."""
+    """Safety net for dropped router filters, including numeric comparisons.
+
+    Field values in structured data are a closed vocabulary, so known values
+    can be detected directly in the question text, independent of whatever
+    the LLM router did or didn't return. Matching uses word boundaries
+    rather than a plain substring search: a short value like "IT" or "US" is
+    a literal substring of ordinary English words ("with", "wait", "unit",
+    ...), so a naive `in`/`str.find` check can silently match the wrong part
+    of the question — this is exactly what broke the previous version's
+    position-based "or" detection for a "Finance or IT" style question.
+    """
     if not records:
         return []
+
+    numeric = _infer_numeric_filters(question, records)
+    numeric_fields = {f["field"] for f in numeric}
+
     field_values = {}
     for r in records:
         for k, v in r.items():
             if isinstance(v, str) and v.strip():
                 field_values.setdefault(k, set()).add(v.strip())
+
     q_lower = question.lower()
-    candidates = []
+    has_or = " or " in q_lower
+
+    candidates = []  # (value_len, field, value) — sorted so longer matches win ties
     for field, values in field_values.items():
-        for value in values:
-            if len(value) >= 2 and value.lower() in q_lower:
-                candidates.append((len(value), field, value))
-    # Longest match first, so "On Leave" wins over any shorter incidental match.
-    candidates.sort(reverse=True)
-    inferred, seen_fields = [], set()
-    for _, field, value in candidates:
-        if field in seen_fields:
+        if field in numeric_fields:
             continue
-        seen_fields.add(field)
-        inferred.append({"field": field, "operator": "equals", "value": value})
+        for value in values:
+            if len(value) < 2:
+                continue
+            pattern = r"(?<!\w)" + re.escape(value.lower()) + r"(?!\w)"
+            if re.search(pattern, q_lower):
+                candidates.append((len(value), field, value))
+
+    candidates.sort(reverse=True)
+
+    order = []
+    grouped: dict[str, list[str]] = {}
+    for _, field, value in candidates:
+        if field not in grouped:
+            grouped[field] = []
+            order.append(field)
+        grouped[field].append(value)
+
+    inferred = list(numeric)
+    for field in order:
+        values = grouped[field]
+        if len(values) >= 2 and has_or:
+            inferred.append({"field": field, "operator": "in", "value": list(dict.fromkeys(values))})
+        else:
+            inferred.append({"field": field, "operator": "equals", "value": values[0]})
+
     return inferred
 
 
 def apply_filters(records, filters):
+    """Apply structured filters. Separate filter objects are AND-ed together."""
+    normalized_filters = _normalize_filters("", filters)
     result = []
+
     for record in records:
         ok = True
-        for condition in filters:
-            actual = record.get(condition.get("field")); expected = condition.get("value")
-            if actual is None: ok = False; break
-            a, e = str(actual).strip().lower(), str(expected).strip().lower()
+        for condition in normalized_filters:
+            actual = record.get(condition.get("field"))
+            expected = condition.get("value")
             op = condition.get("operator", "equals")
-            if op == "equals" and a != e: ok = False; break
-            if op == "contains" and e not in a: ok = False; break
-        if ok: result.append(record)
+
+            if actual is None:
+                ok = False
+                break
+
+            if op in {"gt", "gte", "lt", "lte"}:
+                try:
+                    a_num = _parse_number(actual)
+                    e_num = _parse_number(expected)
+                except (TypeError, ValueError):
+                    ok = False
+                    break
+                if op == "gt" and not a_num > e_num:
+                    ok = False
+                elif op == "gte" and not a_num >= e_num:
+                    ok = False
+                elif op == "lt" and not a_num < e_num:
+                    ok = False
+                elif op == "lte" and not a_num <= e_num:
+                    ok = False
+                if not ok:
+                    break
+                continue
+
+            a = str(actual).strip().lower()
+            if op == "equals":
+                if a != str(expected).strip().lower():
+                    ok = False
+                    break
+            elif op == "contains":
+                if str(expected).strip().lower() not in a:
+                    ok = False
+                    break
+            elif op == "in":
+                values = expected if isinstance(expected, list) else [expected]
+                if a not in {str(v).strip().lower() for v in values}:
+                    ok = False
+                    break
+            elif op == "not_equals":
+                if a == str(expected).strip().lower():
+                    ok = False
+                    break
+            elif op == "not_in":
+                values = expected if isinstance(expected, list) else [expected]
+                if a in {str(v).strip().lower() for v in values}:
+                    ok = False
+                    break
+
+        if ok:
+            result.append(record)
     return result
 
 
@@ -478,11 +759,26 @@ Rules: do not invent facts; use supplied structured records for lists; if the ev
 
 
 def _describe_filters(filters):
-    if not filters: return None
+    if not filters:
+        return None
     parts = []
     for f in filters:
-        op = "contains" if f.get("operator") == "contains" else "="
-        parts.append(f'{f.get("field", "?")} {op} "{f.get("value", "?")}"')
+        field = f.get("field", "?")
+        op = f.get("operator", "equals")
+        value = f.get("value", "?")
+        if op == "contains":
+            parts.append(f'{field} contains "{value}"')
+        elif op in {"in", "not_in"}:
+            values = value if isinstance(value, list) else [value]
+            rendered = ", ".join(f'"{v}"' for v in values)
+            parts.append(f"{field} {op.replace('_', ' ')} [{rendered}]")
+        elif op == "not_equals":
+            parts.append(f'{field} != "{value}"')
+        elif op in {"gt", "gte", "lt", "lte"}:
+            symbol = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}[op]
+            parts.append(f'{field} {symbol} {value}')
+        else:
+            parts.append(f'{field} = "{value}"')
     return " and ".join(parts)
 
 
@@ -529,7 +825,8 @@ def query_document(question, document_id=None, top_k=TOP_K):
     for d in scoped_docs: records.extend(get_records(d["document_id"]))
     document_label = scoped_docs[0]["filename"] if len(scoped_docs) == 1 else f"All documents ({len(scoped_docs)})"
 
-    route = classify_query(question, records); strategy = route.get("strategy", "hybrid_retrieval"); filters = route.get("filters", [])
+    route = classify_query(question, records); strategy = route.get("strategy", "hybrid_retrieval"); filters = _normalize_filters(question, route.get("filters", []), records)
+    route = {**route, "filters": filters}
     if strategy == "hybrid_retrieval" and filters:
         # Extra insurance: the prompt only ever populates filters for
         # structured strategies, so a non-empty filter list alongside a
@@ -547,7 +844,7 @@ def query_document(question, document_id=None, top_k=TOP_K):
         # ourselves. See infer_filters_from_question() for why this matters.
         inferred = infer_filters_from_question(question, records)
         if inferred:
-            filters = inferred
+            filters = _normalize_filters(question, inferred, records)
             route = {**route, "filters": filters, "reason": route.get("reason", "") + " (filters auto-detected from question text; router returned none)"}
     if strategy == "structured_filter":
         matched = apply_filters(records, filters)
