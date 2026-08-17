@@ -6,3 +6,4 @@ storage/*
 !storage/.gitkeep
 .streamlit/
 .DS_Store
+results/

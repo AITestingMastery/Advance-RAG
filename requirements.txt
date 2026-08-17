@@ -6,3 +6,7 @@ pypdf
 python-docx
 rank-bm25
 chromadb
+ragas
+langchain-community==0.3.0
+datasets
+pandas

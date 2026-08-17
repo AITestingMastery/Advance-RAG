@@ -155,17 +155,38 @@ python verify.py
 
 This exercises the PDF, DOCX, CSV, and TXT/MD loaders, chunking, and record normalization with synthetic in-memory files, and prints `All offline checks passed.` on success.
 
+## 10. Evaluating the RAG pipeline
+
+Two additional scripts evaluate the router + retrieval + generation pipeline itself, as opposed to `verify.py`'s offline unit tests of individual functions:
+
+```bash
+# Offline: proves the eval harness's scoring logic is correct, no API key needed
+python3 test_evaluate_rag_offline.py
+
+# Live: evaluates the real app against whatever's indexed in storage/rag.db
+export OPENAI_API_KEY=sk-...
+pip install ragas "langchain-community==0.3.0" datasets pandas
+python3 evaluate_rag.py --out results/eval_report.csv
+```
+
+`evaluate_rag.py` needs a document already indexed (upload one via `streamlit run app.py` first, or call `advanced_rag.process_document()` directly) and measures three things, kept deliberately separate: **router accuracy** (did `classify_query()` pick the right strategy for each question?), **filter/count correctness** (does `structured_filter`/`aggregation`/`exact_lookup`'s record count match an independent oracle computed from hand-specified filters, not the router's own output?), and **RAGAS generation quality** (faithfulness/answer relevancy/context precision/recall — computed only on questions that land on `hybrid_retrieval`, since the structured paths already force faithfulness by construction). Add `--skip-ragas` to run only the first two, with no LLM-judge API calls.
+
+`test_evaluate_rag_offline.py` mirrors `verify.py`'s approach — it seeds a scratch SQLite+Chroma store with fake records and monkeypatches the OpenAI-touching functions with deterministic fakes, then proves `evaluate_rag.py`'s scoring logic (router-accuracy comparison, oracle-count comparison, and the forced-hybrid isolation trick used to get RAGAS coverage on the hybrid path) is correct against the real `process_document`/`apply_filters`/`query_document` code, without needing an API key or real LLM calls.
+
 ## Project structure
 
 ```
 advanced-rag/
-├── advanced_rag.py     # Core RAG logic: loaders, chunking, storage, routing, retrieval
-├── app.py              # Streamlit UI
-├── verify.py           # Offline smoke test (no API key required)
+├── advanced_rag.py               # Core RAG logic: loaders, chunking, storage, routing, retrieval
+├── app.py                        # Streamlit UI
+├── verify.py                     # Offline smoke test (no API key required)
+├── evaluate_rag.py                # Live evaluation: router accuracy, count correctness, RAGAS
+├── test_evaluate_rag_offline.py   # Offline self-test for evaluate_rag.py's scoring logic
 ├── requirements.txt
 ├── .env.example
 ├── README.md            # This file — setup & usage
 ├── IMPLEMENTATION.md    # Architecture / design notes
+├── results/              # Created by evaluate_rag.py: eval_report.csv
 └── storage/             # Created automatically: rag.db + chroma/
 ```
 
