@@ -19,6 +19,7 @@ Extract text + structured records
 
 ## What's new in this version
 
+- **Live weather (v1.1)**: a fifth router strategy, `live_lookup`, answers "what's the weather in \<city\> right now?" style questions from a live API call — no document upload needed. See section 11 below.
 - **Multiple file types**: upload PDF, DOCX, CSV, TXT, and Markdown files (previously PDF-only).
 - **Multiple files at once**: the uploader accepts a batch of files in one go, in any mix of formats.
 - **Multi-document questions fixed**: previously the app silently answered only from the single most-recently-uploaded file. You can now ask across *all* indexed documents at once, or pick one specific document to scope a question to.
@@ -75,10 +76,12 @@ Open `.env` and set your key:
 OPENAI_API_KEY=sk-your-real-key-here
 RAG_CHAT_MODEL=gpt-4o-mini
 RAG_EMBED_MODEL=text-embedding-3-small
+OPENWEATHER_API_KEY=your-openweathermap-key
 ```
 
 - `RAG_CHAT_MODEL` — used for query routing, structured extraction, and answer generation. `gpt-4o-mini` is a good balance of cost/quality; swap in a stronger model (e.g. `gpt-4o`) if you need better reasoning on messy documents.
 - `RAG_EMBED_MODEL` — used for chunk embeddings. Keep this consistent once you've indexed documents — switching embedding models after data is already indexed will make old and new vectors incompatible (see [Resetting data](#6-resetting--upgrading-data) below).
+- `OPENWEATHER_API_KEY` — optional; only needed for live weather questions (the `live_lookup` strategy, see section 11 below). Everything else in this app works without it. Free tier at [openweathermap.org/api](https://openweathermap.org/api) is enough.
 
 Never commit `.env` — it's already listed in `.gitignore`.
 
@@ -173,15 +176,30 @@ python3 evaluate_rag.py --out results/eval_report.csv
 
 `test_evaluate_rag_offline.py` mirrors `verify.py`'s approach — it seeds a scratch SQLite+Chroma store with fake records and monkeypatches the OpenAI-touching functions with deterministic fakes, then proves `evaluate_rag.py`'s scoring logic (router-accuracy comparison, oracle-count comparison, and the forced-hybrid isolation trick used to get RAGAS coverage on the hybrid path) is correct against the real `process_document`/`apply_filters`/`query_document` code, without needing an API key or real LLM calls.
 
+## 11. Live data: asking about current weather (v1.1)
+
+Alongside the four document-based strategies, the router also recognizes questions about real-world conditions that no uploaded document could ever answer — starting with current weather. Ask something like:
+
+```
+What is the weather in Hyderabad right now?
+Current temperature in New York?
+```
+
+and the router picks a fifth strategy, `live_lookup`, which calls the OpenWeatherMap API directly (see `OPENWEATHER_API_KEY` in section 3) instead of retrieving anything from `storage/`. This works even if you haven't uploaded any document yet — live questions don't need an indexed corpus. If `OPENWEATHER_API_KEY` isn't set, or the city can't be resolved, you'll get a plain "insufficient evidence" style answer rather than a guess — see `IMPLEMENTATION.md`'s "Live data (v1.1)" section for the full design rationale (why this is never cached into Chroma/SQLite, and a real city-extraction bug it caught early).
+
+Offline coverage: `python3 test_live_data_offline.py` (no API keys, no network calls — a fake `requests.get` stands in for the real weather API).
+
 ## Project structure
 
 ```
 advanced-rag/
 ├── advanced_rag.py               # Core RAG logic: loaders, chunking, storage, routing, retrieval
+├── live_data.py                   # v1.1: live weather lookup (the 5th, live_lookup strategy)
 ├── app.py                        # Streamlit UI
 ├── verify.py                     # Offline smoke test (no API key required)
 ├── evaluate_rag.py                # Live evaluation: router accuracy, count correctness, RAGAS
 ├── test_evaluate_rag_offline.py   # Offline self-test for evaluate_rag.py's scoring logic
+├── test_live_data_offline.py      # Offline self-test for live_data.py + the live_lookup strategy
 ├── requirements.txt
 ├── .env.example
 ├── README.md            # This file — setup & usage

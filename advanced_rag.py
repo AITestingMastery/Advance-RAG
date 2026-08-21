@@ -10,6 +10,8 @@ from pypdf import PdfReader
 from docx import Document as DocxDocument
 from rank_bm25 import BM25Okapi
 
+import live_data
+
 load_dotenv()
 CHAT_MODEL = os.getenv("RAG_CHAT_MODEL", "gpt-4o-mini")
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-3-small")
@@ -276,7 +278,7 @@ def get_records(document_id):
     return [json.loads(x["record_json"]) for x in rows]
 
 
-VALID_STRATEGIES = ("structured_filter", "aggregation", "exact_lookup", "hybrid_retrieval")
+VALID_STRATEGIES = ("structured_filter", "aggregation", "exact_lookup", "hybrid_retrieval", "live_lookup")
 
 # Structured Outputs schema for the router. This is the real fix for a
 # failure we observed in the wild: with the older loose {"type":"json_object"}
@@ -337,6 +339,7 @@ def _normalize_strategy(raw):
     for candidate in VALID_STRATEGIES:
         if candidate in raw_l:
             return candidate
+    if "weather" in raw_l or "temperature" in raw_l or "forecast" in raw_l or "live" in raw_l: return "live_lookup"
     if "aggregat" in raw_l or "count" in raw_l: return "aggregation"
     if "filter" in raw_l: return "structured_filter"
     if "lookup" in raw_l: return "exact_lookup"
@@ -356,7 +359,8 @@ def _classify_query_prompt(question, fields):
     return f"""Classify this question.
 Available fields: {fields}
 Question: {question}
-Use structured_filter for lists with field conditions, aggregation for count questions, exact_lookup for direct record lookup, otherwise hybrid_retrieval.
+Use structured_filter for lists with field conditions, aggregation for count questions, exact_lookup for direct record lookup, live_lookup for questions asking about current real-world conditions that cannot be found in the uploaded documents (e.g. "what is the weather in <city> right now?", "current temperature in <city>"), otherwise hybrid_retrieval.
+For live_lookup questions, leave filters empty — there is nothing to filter, the answer comes from a live external API, not from the indexed records.
 Operators:
 - equals: exact single value
 - contains: substring matching
@@ -808,11 +812,47 @@ Write one concise sentence answering the question. You MUST state the number {co
     return text
 
 
+def live_weather_answer(question):
+    """Handles the live_lookup strategy end to end: extract a city from the
+    question, fetch it from live_data.get_current_weather(), and phrase it
+    with the same generate_answer() grounding used by every other strategy.
+    Never writes the result anywhere persistent — a temperature reading is
+    stale within minutes, so caching it into Chroma/SQLite the way document
+    content is cached would silently start lying within the hour."""
+    city = live_data.extract_city(question)
+    if not city:
+        evidence = {"error": "Could not determine which city the question refers to."}
+    else:
+        evidence = live_data.get_current_weather(city)
+    answer = generate_answer(question, evidence, "Live data lookup")
+    source = None if "error" in evidence else {"type": "live_api", "provider": "OpenWeatherMap", "city": evidence.get("city", city)}
+    return {
+        "answer": answer,
+        "strategy": "Live data lookup",
+        "filters": [],
+        "matched_records": [],
+        "record_count": 0 if "error" in evidence else 1,
+        "sources": [source] if source else [],
+        "live_evidence": evidence,
+    }
+
+
 def query_document(question, document_id=None, top_k=TOP_K):
     """document_id=None queries across every indexed document; pass a
-    specific document_id to scope the question to just that one file."""
+    specific document_id to scope the question to just that one file.
+
+    live_lookup is checked before the "no documents indexed" guard below —
+    a weather question has nothing to do with whether any file has been
+    uploaded, and requiring an unrelated document first would make the
+    live-data path unreachable in a fresh install."""
     all_documents = list_documents()
-    if not all_documents: raise RuntimeError("No documents are indexed.")
+    if document_id is None and not all_documents:
+        route = classify_query(question, [])
+        strategy = _normalize_strategy(route.get("strategy"))
+        if strategy == "live_lookup":
+            result = live_weather_answer(question)
+            return {**result, "route": route, "document_name": "No documents indexed"}
+        raise RuntimeError("No documents are indexed.")
     if document_id:
         scoped_docs = [d for d in all_documents if d["document_id"] == document_id]
         if not scoped_docs: raise RuntimeError("Selected document was not found (it may have been deleted).")
@@ -856,6 +896,9 @@ def query_document(question, document_id=None, top_k=TOP_K):
     if strategy == "exact_lookup":
         matched = exact_lookup(question, records, filters)
         return {"answer": generate_answer(question, matched, "Exact structured lookup"), "strategy": "Exact structured lookup", "route": route, "filters": filters, "matched_records": matched, "record_count": len(matched), "sources": [], "document_name": document_label}
+    if strategy == "live_lookup":
+        result = live_weather_answer(question)
+        return {**result, "route": route, "document_name": document_label}
     hits = hybrid_search(question, doc_ids, top_k)
     return {"answer": generate_answer(question, [{"rank": h["rank"], "filename": h["filename"], "text": h["text"]} for h in hits], "Hybrid retrieval"),
             "strategy": "Hybrid retrieval", "route": route, "filters": [], "matched_records": [], "record_count": 0, "sources": hits, "document_name": document_label}
