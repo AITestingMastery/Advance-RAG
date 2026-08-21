@@ -81,6 +81,7 @@ STRATEGY_LABEL_TO_KEY = {
     "Structured aggregation": "aggregation",
     "Exact structured lookup": "exact_lookup",
     "Hybrid retrieval": "hybrid_retrieval",
+    "Live data lookup": "live_lookup",
 }
 
 
@@ -312,7 +313,34 @@ GROUND_TRUTH = [
             "salary in INR and location."
         ),
     },
+
+    # ------------------------------------------------------------------------
+    # Live data lookup (v1.1+) -- unlike every other strategy above, these
+    # hit a REAL external API (OpenWeatherMap) when this script runs live,
+    # not just the indexed document data. expected_city is this strategy's
+    # equivalent of oracle_filters: an independently-specified expectation
+    # (never the router's own extraction) that the resolved city actually
+    # matches what the question asked about. Requires OPENWEATHER_API_KEY to
+    # be set for these two rows to score anything other than a graceful
+    # "not configured" error -- see README.md section 11.
+    # ------------------------------------------------------------------------
+
+    {
+        "id": "LIVE-1",
+        "question": "What is the weather in Hyderabad right now?",
+        "expected_strategy": "live_lookup",
+        "expected_city": "Hyderabad",
+    },
+
+    {
+        "id": "LIVE-2",
+        "question": "What is the current temperature in Mumbai?",
+        "expected_strategy": "live_lookup",
+        "expected_city": "Mumbai",
+    },
 ]
+
+
 
 
 # ============================================================================
@@ -756,6 +784,31 @@ def main():
             )
 
         # ------------------------------------------------------------
+        # Live data city correctness -- live_lookup's equivalent of
+        # count_correct above. expected_city is independently specified in
+        # GROUND_TRUTH (never derived from the router's own extraction),
+        # same isolation principle as oracle_filters: this proves "did the
+        # live path resolve the question to the right city," not just "did
+        # apply_filters()/extract_city() agree with themselves."
+        # ------------------------------------------------------------
+
+        expected_city = ground_truth.get("expected_city")
+
+        actual_city = None
+        city_correct = None
+
+        if expected_city is not None:
+
+            live_evidence = result.get("live_evidence") or {}
+
+            actual_city = live_evidence.get("city")
+
+            city_correct = (
+                "error" not in live_evidence
+                and actual_city == expected_city
+            )
+
+        # ------------------------------------------------------------
         # Save row
         # ------------------------------------------------------------
 
@@ -764,6 +817,8 @@ def main():
             "evaluation_type": (
                 "structured"
                 if "oracle_filters" in ground_truth
+                else "live"
+                if expected_city is not None
                 else "hybrid_ragas"
             ),
             "question": question,
@@ -775,6 +830,9 @@ def main():
                 "record_count"
             ),
             "count_correct": count_correct,
+            "expected_city": expected_city,
+            "actual_city": actual_city,
+            "city_correct": city_correct,
             "answer_matches_expected_number": (
                 answer_matches_expected_number
             ),
@@ -811,6 +869,17 @@ def main():
                 f", count expected={expected_count} "
                 f"actual={result.get('record_count')}"
             )
+
+        if city_correct is not None:
+
+            message += (
+                f", city expected={expected_city} "
+                f"actual={actual_city}"
+            )
+            if not city_correct:
+                live_evidence = result.get("live_evidence") or {}
+                if "error" in live_evidence:
+                    message += f" ({live_evidence['error']})"
 
         print(message)
 
@@ -915,6 +984,24 @@ def main():
             / len(structured_rows)
         )
 
+    live_rows = [
+        row
+        for row in per_question
+        if row["city_correct"] is not None
+    ]
+
+    city_accuracy = None
+
+    if live_rows:
+
+        city_accuracy = (
+            sum(
+                bool(row["city_correct"])
+                for row in live_rows
+            )
+            / len(live_rows)
+        )
+
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
@@ -931,6 +1018,14 @@ def main():
             f"Filter/count accuracy: "
             f"{count_accuracy:.0%} "
             f"({len(structured_rows)} structured questions)"
+        )
+
+    if city_accuracy is not None:
+
+        print(
+            f"Live data (city) accuracy: "
+            f"{city_accuracy:.0%} "
+            f"({len(live_rows)} live_lookup questions)"
         )
 
     # =========================================================================

@@ -153,6 +153,51 @@ assert router_correct and count_correct
 print("OK: evaluate_rag.py's scoring logic (router_correct / count_correct) computes correctly "
       "end-to-end against real process_document + query_document code paths")
 
+# --- Confirm evaluate_rag.py's live_lookup scoring (city_correct) is correct
+# (v1.1+ addition). Mirrors the structured_filter check above: fake the
+# router to live_lookup and fake the weather API, then run the exact
+# comparison evaluate_rag.py's main() loop does (result["live_evidence"]'s
+# city vs. an independently-specified expected_city, mirroring how
+# oracle_filters is never the router's own extraction). -------------------
+import live_data  # noqa: E402
+
+_original_get_current_weather = live_data.get_current_weather
+
+
+def _fake_get_current_weather(city):
+    return {"city": city, "temperature_c": 30.0, "feels_like_c": 32.0, "condition": "sunny",
+            "humidity_pct": 40, "wind_kph": 5.0, "observed_at_unix": 1234567890}
+
+
+live_data.get_current_weather = _fake_get_current_weather
+
+
+def _fake_classify_query_live(question, records):
+    return {"strategy": "live_lookup", "operation": None, "filters": [], "reason": "fake router for offline test"}
+
+
+rag.classify_query = _fake_classify_query_live
+
+live_gt_row = {"id": "LIVE-TEST", "expected_strategy": "live_lookup", "expected_city": "Hyderabad"}
+live_result = rag.query_document("What is the weather in Hyderabad right now?")
+live_actual_strategy = ev.STRATEGY_LABEL_TO_KEY.get(live_result["strategy"], "unknown")
+assert live_actual_strategy == "live_lookup", f"unexpected strategy: {live_result['strategy']}"
+live_evidence = live_result.get("live_evidence") or {}
+city_correct = "error" not in live_evidence and live_evidence.get("city") == live_gt_row["expected_city"]
+assert city_correct, f"city_correct scoring wrong: {live_evidence}"
+print(f"OK: evaluate_rag.py's live_lookup scoring (city_correct) computes correctly -> "
+      f"city={live_evidence.get('city')}")
+
+# A wrong-city response must score city_correct=False, not silently pass --
+live_result_wrong_city = rag.query_document("What is the weather in Mumbai right now?")
+live_evidence_wrong = live_result_wrong_city.get("live_evidence") or {}
+city_correct_wrong = "error" not in live_evidence_wrong and live_evidence_wrong.get("city") == live_gt_row["expected_city"]
+assert not city_correct_wrong, "city_correct must be False when the resolved city doesn't match expected_city"
+print("OK: evaluate_rag.py's city_correct scoring correctly fails a mismatched city instead of false-passing")
+
+live_data.get_current_weather = _original_get_current_weather
+rag.classify_query = _fake_classify_query  # restore the structured-question fake router used above
+
 # --- run_forced_hybrid_question(): the monkeypatch-and-restore isolation ----
 # This is the function evaluate_rag.py uses so RAGAS can score the Hybrid RAG
 # path even on a question the real router correctly sends somewhere else.
