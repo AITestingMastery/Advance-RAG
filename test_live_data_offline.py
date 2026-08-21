@@ -107,8 +107,33 @@ print("OK: get_current_weather() serves a repeated same-city question from cache
 # =============================================================================
 live_data._cache.clear()
 live_data.OPENWEATHER_API_KEY = None
+# Also blank the real environment variable, not just the module attribute --
+# on a machine with a real OPENWEATHER_API_KEY in .env (loaded via
+# advanced_rag's load_dotenv() at import time), get_current_weather()'s
+# os.getenv() fallback would otherwise find that real key and this "no key
+# configured" test would falsely hit the real API instead of erroring.
+_real_key = os.environ.pop("OPENWEATHER_API_KEY", None)
 no_key_result = live_data.get_current_weather("Hyderabad")
+if _real_key is not None:
+    os.environ["OPENWEATHER_API_KEY"] = _real_key
 assert "error" in no_key_result, "missing API key should produce an error dict, not a fake reading"
+# --- Regression: a real bug found in live testing. If the module-level
+# OPENWEATHER_API_KEY constant froze in as None (e.g. because live_data was
+# imported before the app's load_dotenv() call ran), the key must still be
+# picked up from a live process environment variable at call time instead
+# of failing forever. ---------------------------------------------------
+os.environ["OPENWEATHER_API_KEY"] = "fake-key-from-process-env"
+live_data._cache.clear()
+live_data.requests.get = _fake_requests_get
+env_fallback_result = live_data.get_current_weather("Hyderabad")
+assert "error" not in env_fallback_result, (
+    "regression: get_current_weather() did not fall back to a live os.getenv() read when "
+    "the module-level OPENWEATHER_API_KEY constant was None -- this is exactly the import-"
+    "order bug caught during live testing (live_data imported before load_dotenv() ran)"
+)
+del os.environ["OPENWEATHER_API_KEY"]
+print("OK: get_current_weather() falls back to a live os.getenv() read when the module-level "
+      "constant is None (import-order regression guard)")
 print(f"OK: missing OPENWEATHER_API_KEY -> {no_key_result['error']!r}")
 
 live_data.OPENWEATHER_API_KEY = "fake-key-for-test"

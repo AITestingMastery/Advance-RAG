@@ -13,6 +13,14 @@ from rank_bm25 import BM25Okapi
 import live_data
 
 load_dotenv()
+# Imported after load_dotenv() on purpose: live_data.py reads
+# OPENWEATHER_API_KEY at import time, so importing it any earlier would
+# silently freeze that constant in as None even with a real key in .env.
+# live_data.get_current_weather() re-checks os.getenv() as a fallback too
+# (defense in depth), but there's no reason to rely on that fallback here
+# when getting the import order right costs nothing.
+import live_data
+
 CHAT_MODEL = os.getenv("RAG_CHAT_MODEL", "gpt-4o-mini")
 EMBED_MODEL = os.getenv("RAG_EMBED_MODEL", "text-embedding-3-small")
 TOP_K, CHUNK_SIZE, CHUNK_OVERLAP, RRF_K = 5, 700, 100, 60

@@ -59,8 +59,17 @@ def get_current_weather(city: str) -> dict:
     straight to generate_answer() and get an honest "insufficient evidence"
     answer rather than a stack trace or (worse) a guessed number. This
     mirrors every other strategy in this app: never let a failure upstream
-    turn into a hallucinated answer downstream."""
-    if not OPENWEATHER_API_KEY:
+    turn into a hallucinated answer downstream.
+
+    Re-checks os.getenv() here rather than trusting only the module-level
+    OPENWEATHER_API_KEY constant above: that constant is read at import
+    time, and if this module gets imported before the app's load_dotenv()
+    call runs, it silently freezes in as None even when .env has a real
+    key. This was a real bug found during live testing -- the router chose
+    live_lookup correctly, but every call failed with "not configured"
+    because of import order, not a missing key."""
+    api_key = OPENWEATHER_API_KEY or os.getenv("OPENWEATHER_API_KEY")
+    if not api_key:
         return {"error": "OPENWEATHER_API_KEY is not configured."}
 
     key = city.strip().lower()
@@ -72,7 +81,7 @@ def get_current_weather(city: str) -> dict:
     try:
         resp = requests.get(
             OPENWEATHER_URL,
-            params={"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"},
+            params={"q": city, "appid": api_key, "units": "metric"},
             timeout=8,
         )
     except requests.RequestException as e:

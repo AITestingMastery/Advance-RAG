@@ -130,10 +130,17 @@ if documents:
                     st.subheader("📋 Verified Records")
                     st.dataframe(result["matched_records"], use_container_width=True, hide_index=True)
                 if result.get("sources"):
-                    st.subheader("📚 Retrieved Evidence")
                     for source in result["sources"]:
-                        with st.expander(f"{source['filename']} · Chunk {source['rank']} | Vector #{source['vector_rank']} | BM25 #{source['bm25_rank']}"):
-                            st.write(source["text"])
+                        if source.get("type") == "live_api":
+                            # live_lookup's source shape ({"type", "provider", "city"}) is
+                            # deliberately different from a hybrid_retrieval chunk -- there's
+                            # no filename/rank/vector_rank/bm25_rank because nothing was
+                            # retrieved from storage, it was fetched live at question time.
+                            st.info(f"🌐 Live API: {source.get('provider', 'external API')} — "
+                                    f"city: {source.get('city', '?')} (fetched live, not stored)")
+                        else:
+                            with st.expander(f"{source['filename']} · Chunk {source['rank']} | Vector #{source['vector_rank']} | BM25 #{source['bm25_rank']}"):
+                                st.write(source["text"])
                 st.info("🎓 Structured questions use verified extracted records; other questions fall back to hybrid retrieval.")
             except Exception as exc:
                 st.error(f"Query failed: {exc}")
